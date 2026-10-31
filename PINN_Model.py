@@ -1,0 +1,24 @@
+import torch.nn as nn
+
+class PINN_Model(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_layers):
+        super(PINN_Model, self).__init__()
+        layers = []
+        layers.append(nn.Linear(input_dim, hidden_layers[0]))
+        layers.append(nn.Tanh())
+        
+        for i in range(len(hidden_layers) - 1):
+            layers.append(nn.Linear(hidden_layers[i], hidden_layers[i + 1]))
+            layers.append(nn.Tanh())
+        
+        layers.append(nn.Linear(hidden_layers[-1], output_dim))
+        self.model = nn.Sequential(*layers)
+        self.apply(self._init_weights)          # initialize all layers
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight, gain=nn.init.calculate_gain('tanh'))
+            nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        return self.model(x)
