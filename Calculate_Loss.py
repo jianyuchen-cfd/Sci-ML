@@ -1,6 +1,18 @@
 import torch
 
-def physic_loss(model, x, y, Re):
+def wall_function_loss(model, utau_net, nu_mol=1.12e-5, n=40, y_p=0.028, x_max=2.4,
+                       kappa=0.41, E=9.8, nu_t_max=0.01):
+    x = (x_max * torch.rand(n, 1)).requires_grad_(True)
+    y = torch.full((n, 1), 1 - y_p).requires_grad_(True)
+    out = model(torch.cat([x, y], dim=1))
+    u = grad(out[:, 0:1], y)
+    nu_eff = nu_mol + nu_t_max * torch.sigmoid(out[:, 2:3])
+    ut = utau_net(x)
+    R1 = u - ut / kappa * torch.log(E * y_p * ut / nu_mol)       # log law
+    R2 = (-nu_eff * grad(u, y)) / ut**2 - 1.0                    # shear balance, dimensionless
+    return torch.mean(R1**2 + R2**2)
+
+def physic_loss(model, x, y, Re, nu_mol=1.12e-5, nu_t_max=0.01):
     """
     Calculate the physics-informed loss for a Navier-Stokes momentum equation.
 
@@ -19,7 +31,8 @@ def physic_loss(model, x, y, Re):
     # Forward pass through the model
     output = model(input_tensor)
     psi, p = output[:, 0:1], output[:, 1:2]  # Assuming the model outputs stream function and pressure
-
+    
+    
     u = grad(psi, y)  # u = d(psi)/dy
     v = -grad(psi, x)  # v = -d(psi)/dx
 
@@ -27,11 +40,20 @@ def physic_loss(model, x, y, Re):
     v_x, v_y = grad(v, x), grad(v, y)
     p_x, p_y = grad(p, x), grad(p, y)
 
-    u_xx, u_yy = grad(u_x, x), grad(u_y, y)
-    v_xx, v_yy = grad(v_x, x), grad(v_y, y)
-
-    f_x = u * u_x + v * u_y + p_x - (u_xx + u_yy) / Re  # x-momentum equation residual
-    f_y = u * v_x + v * v_y + p_y - (v_xx + v_yy) / Re  # y-momentum equation residual
+    #u_xx, u_yy = grad(u_x, x), grad(u_y, y)
+    #v_xx, v_yy = grad(v_x, x), grad(v_y, y)
+    
+    
+    #f_x = u * u_x + v * u_y + p_x - (u_xx + u_yy) / Re  # x-momentum equation residual
+    #f_y = u * v_x + v * v_y + p_y - (v_xx + v_yy) / Re  # y-momentum equation residual
+    
+    
+    # Implement the wall function and effective viscosity
+    s = output[:, 2:3]
+    nu = nu_mol + nu_t_max * torch.sigmoid(s)
+    txx, txy, tyy = 2*nu*u_x, nu*(u_y + v_x), 2*nu*v_y 
+    f_x = u*u_x + v*u_y + p_x - (grad(txx, x) + grad(txy, y))
+    f_y = u*v_x + v*v_y + p_y - (grad(txy, x) + grad(tyy, y))
 
     residuals = torch.mean(f_x ** 2 + f_y ** 2)  # Replace this with the actual computation of residuals
 
@@ -40,7 +62,7 @@ def physic_loss(model, x, y, Re):
 def grad(f,v):
     return torch.autograd.grad(f, v, grad_outputs=torch.ones_like(f), create_graph=True)[0]
 
-def boundary_loss(model, x_boundary, y_boundary):
+def boundary_loss(model, x_boundary, y_boundary, relax_horizontal=False):
     """
     Calculate the boundary condition loss for the stream function.
 
@@ -64,7 +86,12 @@ def boundary_loss(model, x_boundary, y_boundary):
     u, v = grad(psi_pred, y_boundary), -grad(psi_pred, x_boundary)  # Compute velocity components from stream function
     
     # Compute the mean squared error between predicted and known stream function values
-    loss = torch.mean((u - 0) ** 2 + (v - 0) ** 2)
+    if relax_horizontal:
+        # ceiling (y=1) and floor (y=0): keep only no-penetration (v = 0), leave the tangential u free
+        horiz = ((y_boundary < 1e-6) | (y_boundary > 1 - 1e-6)).float()
+        loss = torch.mean(u**2 * (1 - horiz) + v**2)
+    else:
+        loss = torch.mean(u**2 + v**2)
 
     return loss
 

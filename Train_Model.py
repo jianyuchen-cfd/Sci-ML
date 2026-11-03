@@ -1,7 +1,13 @@
 import copy
 import torch
-from Calculate_Loss import data_loss, physic_loss, boundary_loss
+from Calculate_Loss import data_loss, physic_loss, boundary_loss, wall_function_loss
 
+class UTau(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = torch.nn.Sequential(torch.nn.Linear(1, 20), torch.nn.Tanh(), torch.nn.Linear(20, 20), torch.nn.Tanh(), torch.nn.Linear(20, 1))
+    def forward(self, x):
+        return 0.05 * torch.nn.functional.softplus(self.net(x / 3.0))
 
 def sample_wall_points(n=40, L=3.0, H=1.0, h1=0.056, h2=0.16):
     lengths = torch.tensor([L, L, H - h1, H - h2])
@@ -15,10 +21,13 @@ def sample_wall_points(n=40, L=3.0, H=1.0, h1=0.056, h2=0.16):
     m = seg == 3; x[m] = L;         y[m] = h2 + (H - h2) * t[m]    # right wall, above the outlet
     return x.reshape(-1, 1), y.reshape(-1, 1)
 
-def sample_collocation(n=640, n_wall=0, L=3.0, H=1.0, strip=0.1):
+def sample_collocation(n=640, n_wall=0, L=3.0, H=1.0, strip=0.1, y_p = 0.028):
     # uniform points over the whole room
     x = L * torch.rand(n, 1)
-    y = H * torch.rand(n, 1)
+    #y = H * torch.rand(n, 1)
+    
+    # Implement the wall function and effective viscosity
+    y = y_p + (H - 2*y_p) * torch.rand(n, 1) 
 
     # n_wall extra points in a thin strip along each of the four walls
     xs, ys = [x], [y]
@@ -31,7 +40,7 @@ def sample_collocation(n=640, n_wall=0, L=3.0, H=1.0, strip=0.1):
     return torch.cat(xs), torch.cat(ys)
 
 def train_model(model, optimizer,  data_points, val_points, Re,
-             n_collocation_points=640, L=3.0, H=1.0, num_epochs=3000):
+             n_collocation_points=640, L=3.0, H=1.0, num_epochs=3000, relax_horizontal=False):
     """
     Train the PINN model using physics-informed loss and boundary condition loss.
 
@@ -49,16 +58,20 @@ def train_model(model, optimizer,  data_points, val_points, Re,
     """
     x_d, y_d, ux_d = data_points
     x_v, y_v, ux_v = val_points
-
+    
+    # Implement the wall function
+    utau = UTau()
+    w_cap = 1000
+    
     best_val, best_state = float('inf'), None
-    running_loss = {"phys": [], "data": [], "boundary": [], "total": [], 'alpha': [], 'beta': []}
-
+    running_loss = {"phys": [], "data": [], "boundary": [], "total": [], 'alpha': [], 'beta': [], 'wallf':[]}
+    
     def grad_stats(loss, params):
         g = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
         g = torch.cat([gi.flatten() for gi in g if gi is not None])
         return g.abs().max(), g.abs().mean()
 
-    alpha, beta, a = 1.0, 150.0, 0.1
+    alpha, beta, gamma, a = 1.0, 10, 5.0, 0.1
     params = [p for p in model.parameters()]
 
     for epoch in range(num_epochs):
@@ -70,25 +83,36 @@ def train_model(model, optimizer,  data_points, val_points, Re,
         data_loss_value = data_loss(model, x_d, y_d, ux_d)
 
         # Calculate boundary condition loss (assuming you have boundary data)
-        boundary_loss_value = boundary_loss(model, x_b, y_b)
+        boundary_loss_value = boundary_loss(model, x_b, y_b, relax_horizontal)
+        wall_function_loss_value = wall_function_loss(model, utau)
         """ TEST1: Update the weights for the different loss components """
         if epoch % 10 == 0:                                   # update weights every 10 epochs
             max_eqa, _ = grad_stats(phys_loss, params)
             _, mean_bc   = grad_stats(boundary_loss_value, params)
             _, mean_data = grad_stats(data_loss_value, params)
-            alpha = (1 - a)*alpha + a*(max_eqa/(mean_bc + 1e-12)).item()
-            beta  = (1 - a)*beta  + a*(max_eqa/(mean_data + 1e-12)).item()
+            _, mean_wf = grad_stats(wall_function_loss_value, params)
+            #alpha = (1 - a)*alpha + a*(max_eqa/(mean_bc + 1e-12)).item()
+            #beta  = (1 - a)*beta  + a*(max_eqa/(mean_data + 1e-12)).item()
+            
+            # Implement the wall function loss
+            alpha = (1 - a)*alpha + a*min((max_eqa/(mean_bc   + 1e-12)).item(), w_cap)
+            beta  = (1 - a)*beta  + a*min((max_eqa/(mean_data + 1e-12)).item(), w_cap)
+            gamma = (1 - a)*gamma + a*min((max_eqa/(mean_wf   + 1e-12)).item(), w_cap)
 
         # Total loss (you can weight the losses if needed)
         """TEST2: fixed the weights for the different loss components, data loss: 100, boundary loss: 10, physics loss: 1 """
         #alpha, beta = 10.0, 100.0
-        total_loss = phys_loss + beta * data_loss_value + alpha * boundary_loss_value
+        
+        #total_loss = phys_loss + beta * data_loss_value + alpha * boundary_loss_value
+        
+        #Implement the wall function 
+        total_loss = phys_loss + beta * data_loss_value + alpha * boundary_loss_value + gamma * wall_function_loss_value
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
         
         # validation loss: governing equations + validation data
-        val_loss = phys_loss.item() + data_loss(model, x_v, y_v, ux_v).item()
+        val_loss = phys_loss.item() + data_loss_value + data_loss(model, x_v, y_v, ux_v).item() + wall_function_loss_value
         if val_loss < best_val:
             best_val = val_loss
             best_state = copy.deepcopy(model.state_dict())
@@ -98,6 +122,8 @@ def train_model(model, optimizer,  data_points, val_points, Re,
             running_loss["best_data"]=data_loss_value.item()
             running_loss["best_boundary"]=boundary_loss_value.item()
             running_loss["best_total"]=total_loss.item()
+            running_loss['best_gamma']=gamma
+            running_loss['best_wallf']=wall_function_loss_value.item()
 
         running_loss["phys"].append(phys_loss.item())
         running_loss["data"].append(data_loss_value.item()) 
@@ -105,11 +131,13 @@ def train_model(model, optimizer,  data_points, val_points, Re,
         running_loss["total"].append(total_loss.item())
         running_loss['alpha'].append(alpha)
         running_loss['beta'].append(beta)
+        running_loss['wallf'].append(wall_function_loss_value.item())
 
         if epoch % 100 == 0:
             print(f'Epoch [{epoch}/{num_epochs}], physics Loss: {phys_loss.item():.4f}, \
                    data Loss: {data_loss_value.item():.4f}, boundary Loss: {boundary_loss_value.item():.4f}, \
-                    total Loss: {total_loss.item():.4f}, alpha_bc: {alpha:.2f}, beta_data: {beta:.2f}')
+                    wall function loss: {wall_function_loss_value.item():.4f}, total Loss: {total_loss.item():.4f}, \
+                    alpha_bc: {alpha:.2f}, beta_data: {beta:.2f}, gamma_wallf: {gamma:.2f}')
     # Load the best model state
     model.load_state_dict(best_state)
     return model, running_loss
