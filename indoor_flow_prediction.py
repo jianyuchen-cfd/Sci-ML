@@ -42,7 +42,7 @@ def main(seed, export_dir):
     y_test  = torch.tensor(test_data[:, 1:2], dtype=torch.float32)
     ux_test = torch.tensor(test_data[:, 2:3], dtype=torch.float32)
 
-    pinn_model = PINN_Model(input_dim=2, output_dim=3, hidden_layers=[50, 50, 50, 50])
+    pinn_model = PINN_Model(input_dim=2, output_dim=2, hidden_layers=[50, 50, 50, 50])
     xy_stat = torch.cat([3.0 * torch.rand(100000, 1), torch.rand(100000, 1)], dim=1)
     pinn_model.set_input_stats(xy_stat)
 
@@ -51,8 +51,9 @@ def main(seed, export_dir):
     test_points = (x_test, y_test, ux_test)
 
     optimizer = torch.optim.Adam(pinn_model.parameters(), lr=0.001)
+    
     trained_model, running_loss = train_model(pinn_model, optimizer=optimizer,
-                data_points=data_points, val_points=val_points, Re=5000, relax_horizontal=True)
+                data_points=data_points, val_points=val_points, Re=2000, relax_horizontal=True)
     running_loss['seed'] = seed
     torch.save(pinn_model.state_dict(), f'{export_dir}trial_{seed}.pth')
 
@@ -124,8 +125,8 @@ def plot_velocity_field(model, running_loss, export_dir, L=3.0, H=1.0):
     print("Test relative L2 Error: ", (torch.norm(ux_pred - ux_true) / torch.norm(ux_true)).item())
     print("Test absolute L2 Error: ", torch.norm(ux_pred - ux_true).item())
     print("Test Root Mean Square Error: ", torch.sqrt(torch.mean((ux_pred - ux_true) ** 2)).item())
-    #print(f"Ceiling error: {running_loss['RMSE_ceiling']}")
-    #print(f"Floor error: {running_loss['RMSE_floor']}")
+    print(f"Ceiling error: {running_loss['RMSE_ceiling']}")
+    print(f"Floor error: {running_loss['RMSE_floor']}")
 
     idx = [25, 50, 78, 106, 0]
     fig, axes = plt.subplots(1, 2, figsize=(10, 8))
@@ -206,11 +207,70 @@ def plot_velocity_field(model, running_loss, export_dir, L=3.0, H=1.0):
     plt.tight_layout()
     plt.savefig(f'{export_dir}velocity_field.png', dpi=300)
     plt.show()
+    
+def plot_results_dict(results_dict):
+    fig_ver, axes_ver = plt.subplots(1, 2, figsize=(10, 8))
+    fig_hor, axes_hor = plt.subplots(2, 1, figsize=(10, 8), constrained_layout=True)
+    for n, (trial_folder, seed) in enumerate(results_dict.items()): 
+        if f'trial_{seed[0]}.pth' in os.listdir(f'./{trial_folder}/'):
+            model = PINN_Model(input_dim=2, output_dim=2, hidden_layers=[50, 50, 50, 50])
+            model.load_state_dict(torch.load(f'./{trial_folder}/trial_{seed[0]}.pth'))
+        else:
+            raise FileNotFoundError(f"Model file for seed {rep['seed[0]']} not found in {trial_folder}")
+
+        data = np.loadtxt('./measurement_all_points.csv', delimiter=',', encoding='utf-8-sig')
+        x_true  = torch.tensor(data[:, 0:1], dtype=torch.float32)
+        y_true  = torch.tensor(data[:, 1:2], dtype=torch.float32).requires_grad_(True)
+        ux_true = torch.tensor(data[:, 2:3], dtype=torch.float32)
+
+        input_tensor = torch.cat((x_true, y_true), dim=1)
+                
+        output = model(input_tensor)
+        psi_pred = output[:, 0:1]
+        ux_pred = torch.autograd.grad(psi_pred, y_true, grad_outputs=torch.ones_like(psi_pred))[0]
+
+        idx = [25, 50, 78, 106, 0]
+        
+        for i in [0,1]:
+            if n == 0:
+                axes_ver[i].plot(ux_true[idx[i-1]:idx[i]], y_true[idx[i-1]:idx[i]].detach().numpy(), marker='o', color='k',label='Experiment')
+            axes_ver[i].plot(ux_pred[idx[i-1]:idx[i]].detach().numpy(), y_true[idx[i-1]:idx[i]].detach().numpy(), linestyle='--', label=seed[1])
+            axes_ver[i].set_xlabel(r'$u_x/u_0$')
+            axes_ver[i].set_ylabel(r'y=x/H')
+            axes_ver[i].set_ylim(0, 1)
+            axes_ver[i].set_xlim(-0.5, 1)
+            axes_ver[i].legend(loc='lower right')
+            axes_ver[i].grid(True, alpha=0.3)
+            if i == 0:
+                axes_ver[i].set_title('x=H')
+            else:
+                axes_ver[i].set_title('x=2H')   
+
+    
+        for i, j in enumerate([2,3]):
+            if n == 0:
+                axes_hor[i].plot(x_true[idx[j-1]:idx[j]].detach().numpy(), ux_true[idx[j-1]:idx[j]], marker='o', color='k',label='Experiment')
+            axes_hor[i].plot(x_true[idx[j-1]:idx[j]].detach().numpy(), ux_pred[idx[j-1]:idx[j]].detach().numpy(), linestyle='--', label=seed[1])
+            axes_hor[i].set_xlabel(r'x/H')
+            axes_hor[i].set_ylabel(r'$u_x/u_0$')
+            axes_hor[i].set_xlim(0, 3)
+            axes_hor[i].legend()
+            axes_hor[i].grid(True, alpha=0.3)
+            if i == 0:
+                axes_hor[i].set_title('y=H-0.5h')
+                axes_hor[i].set_ylim(-0.5, 1.5)
+            else:
+                axes_hor[i].set_title('y=0.5h') 
+                axes_hor[i].set_ylim(-0.5, 0.5)
+
+    fig_ver.savefig('pred_vs_exp_vertical_velocity.png', dpi=300)                                       # CHANGED: after the loop, by figure name
+    fig_hor.savefig('pred_vs_exp_horizontal_velocity.png', dpi=300)
+    plt.show()
 
 
 if __name__ == "__main__":
-    N_TRIALS = 5
-    export_dir = './Running_Trial_wf_1/'
+    N_TRIALS = 20
+    export_dir = './Running_Trial_wf_6/'
     results = []
     for seed in range(N_TRIALS):
         if not os.path.exists(export_dir):
@@ -234,13 +294,26 @@ if __name__ == "__main__":
     print('representative seed (closest to the median):', rep['seed'])
 
     if f'trial_{rep["seed"]}.pth' in os.listdir(f'{export_dir}'):
-        model = PINN_Model(input_dim=2, output_dim=3, hidden_layers=[50, 50, 50, 50])
+        model = PINN_Model(input_dim=2, output_dim=2, hidden_layers=[24,24,24,24,24,24,24,24])
         model.load_state_dict(torch.load(f'{export_dir}trial_{rep["seed"]}.pth'))
         running_loss = rep
     else:
         raise FileNotFoundError(f"Model file for seed {rep['seed']} not found in {export_dir}")
 
     plot_velocity_field(model=model, running_loss=running_loss, export_dir=export_dir)
+    
+    results_dict = {
+        "Running_Trial_4": [15, rf"$\beta=10$"],
+        "Running_Trial_2": [15, rf"$\beta=50$"],
+        "Running_Trial_1": [19, rf'$\beta=100$'],
+        "Running_Trial_3": [19, rf'$\beta=150$'],
+        "Running_Trial_wf_1": [15, rf'$\beta=10$, wall relax'],
+        "Running_Trial_wf_3": [1, rf'$\beta=10$, wall relax, turb'],
+        "Running_Trial_wf_4": [18, rf'$\beta=100$, wall function'],
+        "Running_Trial_wf_5": [2, rf'$\beta=10$, wall function']
+        }
+    plot_results_dict(results_dict)
+    
 
 
     

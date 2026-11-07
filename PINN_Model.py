@@ -1,6 +1,5 @@
 import torch.nn as nn
 import torch
-import numpy as np
 
 class PINN_Model(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_layers):
