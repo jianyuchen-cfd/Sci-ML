@@ -1,0 +1,8 @@
+{
+  "height": 0.01,
+  "width": 0.02,
+  "vel_top": 1,
+  "density": 100,
+  "viscosity": 0.1,
+  "rotated": true
+}
